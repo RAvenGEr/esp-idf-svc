@@ -37,9 +37,34 @@ use crate::sysloop::*;
 
 use crate::private::common::*;
 
+pub trait RmiiClockPin {
+    fn pin(&self) -> u32;
+}
+
+impl RmiiClockPin for gpio::Gpio0<gpio::Unknown> {
+    fn pin(&self) -> u32 {
+        0
+    }
+}
+impl RmiiClockPin for gpio::Gpio16<gpio::Unknown> {
+    fn pin(&self) -> u32 {
+        16
+    }
+}
+impl RmiiClockPin for gpio::Gpio17<gpio::Unknown> {
+    fn pin(&self) -> u32 {
+        17
+    }
+}
+
 #[cfg(all(esp32, esp_idf_eth_use_esp32_emac))]
 // TODO: #[derive(Debug)]
-pub struct RmiiEthPeripherals<MDC, MDIO, RST: gpio::OutputPin = gpio::Gpio10<gpio::Unknown>> {
+pub struct RmiiEthPeripherals<
+    MDC,
+    MDIO,
+    RST: gpio::OutputPin = gpio::Gpio10<gpio::Unknown>,
+    CLK: RmiiClockPin = gpio::Gpio0<gpio::Unknown>,
+> {
     pub rmii_rdx0: gpio::Gpio25<gpio::Unknown>,
     pub rmii_rdx1: gpio::Gpio26<gpio::Unknown>,
     pub rmii_crs_dv: gpio::Gpio27<gpio::Unknown>,
@@ -48,8 +73,15 @@ pub struct RmiiEthPeripherals<MDC, MDIO, RST: gpio::OutputPin = gpio::Gpio10<gpi
     pub rmii_tx_en: gpio::Gpio21<gpio::Unknown>,
     pub rmii_txd0: gpio::Gpio19<gpio::Unknown>,
     pub rmii_mdio: MDIO,
-    pub rmii_ref_clk: gpio::Gpio0<gpio::Unknown>,
+    pub rmii_ref_clk: CLK,
     pub rst: Option<RST>,
+}
+
+#[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RmiiClockDirection {
+    In,
+    Out,
 }
 
 #[cfg(all(esp32, esp_idf_eth_use_esp32_emac))]
@@ -142,16 +174,19 @@ pub struct EspEth<P> {
 }
 
 #[cfg(all(esp32, esp_idf_eth_use_esp32_emac))]
-impl<MDC, MDIO, RST> EspEth<RmiiEthPeripherals<MDC, MDIO, RST>>
+impl<MDC, MDIO, RST, CLK> EspEth<RmiiEthPeripherals<MDC, MDIO, RST, CLK>>
 where
     MDC: gpio::OutputPin,
     MDIO: gpio::InputPin + gpio::OutputPin,
     RST: gpio::OutputPin,
+    CLK: RmiiClockPin,
 {
     pub fn new_rmii(
         netif_stack: Arc<EspNetifStack>,
         sys_loop_stack: Arc<EspSysLoopStack>,
-        peripherals: RmiiEthPeripherals<MDC, MDIO, RST>,
+        peripherals: RmiiEthPeripherals<MDC, MDIO, RST, CLK>,
+        #[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+        clock_direction: RmiiClockDirection,
         chipset: RmiiEthChipset,
         phy_addr: Option<u32>,
     ) -> Result<Self, EspError> {
@@ -161,7 +196,15 @@ where
             esp!(ESP_ERR_INVALID_STATE as i32)?;
         }
 
-        let (mac, phy) = Self::initialize(chipset, &peripherals.rst, phy_addr)?;
+        let (mac, phy) = Self::initialize(
+            chipset,
+            #[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+            &peripherals.rmii_ref_clk,
+            #[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+            clock_direction,
+            &peripherals.rst,
+            phy_addr,
+        )?;
 
         let eth = Self::init(netif_stack, sys_loop_stack, mac, phy, None, peripherals)?;
 
@@ -169,7 +212,7 @@ where
         Ok(eth)
     }
 
-    pub fn release(mut self) -> Result<RmiiEthPeripherals<MDC, MDIO, RST>, EspError> {
+    pub fn release(mut self) -> Result<RmiiEthPeripherals<MDC, MDIO, RST, CLK>, EspError> {
         {
             let mut taken = TAKEN.lock();
 
@@ -184,10 +227,18 @@ where
 
     fn initialize(
         chipset: RmiiEthChipset,
+        #[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+        clock: &dyn RmiiClockPin,
+        #[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+        clock_direction: RmiiClockDirection,
         reset: &Option<RST>,
         phy_addr: Option<u32>,
     ) -> Result<(*mut esp_eth_mac_t, *mut esp_eth_phy_t), EspError> {
+        #[cfg(not(any(esp_idf_version = "4.4", esp_idf_version_major = "5")))]
         let mac_cfg = EspEth::<RmiiEthPeripherals<MDC, MDIO>>::eth_mac_default_config();
+        #[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+        let mac_cfg =
+            EspEth::<RmiiEthPeripherals<MDC, MDIO>>::eth_mac_config(clock.pin(), clock_direction);
         let phy_cfg = EspEth::<RmiiEthPeripherals<MDC, MDIO>>::eth_phy_default_config(
             reset.as_ref().map(|p| p.pin()),
             phy_addr,
@@ -888,6 +939,31 @@ impl<P> EspEth<P> {
                 rmii: eth_mac_clock_config_t__bindgen_ty_2 {
                     clock_mode: emac_rmii_clock_mode_t_EMAC_CLK_DEFAULT,
                     clock_gpio: emac_rmii_clock_gpio_t_EMAC_CLK_IN_GPIO,
+                },
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(any(esp_idf_version = "4.4", esp_idf_version_major = "5"))]
+    fn eth_mac_config(clock_gpio: u32, clock_direction: RmiiClockDirection) -> eth_mac_config_t {
+        let mode = match clock_direction {
+            RmiiClockDirection::In => emac_rmii_clock_mode_t_EMAC_CLK_EXT_IN,
+            RmiiClockDirection::Out => emac_rmii_clock_mode_t_EMAC_CLK_OUT,
+        };
+
+        eth_mac_config_t {
+            sw_reset_timeout_ms: 100,
+            rx_task_stack_size: 2048,
+            rx_task_prio: 15,
+            smi_mdc_gpio_num: 23,
+            smi_mdio_gpio_num: 18,
+            flags: 0,
+            interface: eth_data_interface_t_EMAC_DATA_INTERFACE_RMII,
+            clock_config: eth_mac_clock_config_t {
+                rmii: eth_mac_clock_config_t__bindgen_ty_2 {
+                    clock_mode: mode,
+                    clock_gpio,
                 },
             },
             ..Default::default()
